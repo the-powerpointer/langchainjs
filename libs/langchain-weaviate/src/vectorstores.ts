@@ -8,6 +8,12 @@ import {
   MaxMarginalRelevanceSearchOptions,
   VectorStore,
 } from "@langchain/core/vectorstores";
+import { BaseRetriever, BaseRetrieverInput } from "@langchain/core/retrievers";
+import type { DocumentInterface } from "@langchain/core/documents";
+import {
+  CallbackManagerForRetrieverRun,
+  Callbacks,
+} from "@langchain/core/callbacks/manager";
 import type { EmbeddingsInterface } from "@langchain/core/embeddings";
 import { Document } from "@langchain/core/documents";
 import { maximalMarginalRelevance } from "@langchain/core/utils/math";
@@ -84,6 +90,54 @@ export interface WeaviateFilter {
   where: WhereFilter;
 }
 
+export type WeaviateHybridRetrieverKwargs = {
+  alpha?: number;
+  // TODO: to be elaborated
+};
+
+export type WeaviateHybridRetrieverInput = BaseRetrieverInput & {
+  vectorStore: WeaviateStore;
+  k?: number;
+  alpha?: number;
+  filter?: WeaviateFilter;
+  searchKwargs?: WeaviateHybridRetrieverKwargs;
+};
+
+export class WeaviateHybridRetriever extends BaseRetriever {
+  static lc_name() {
+    return "VectorStoreRetriever";
+  }
+
+  get lc_namespace() {
+    return ["langchain_core", "vectorstores"];
+  }
+
+  vectorStore: WeaviateStore;
+  k: number = 4;
+  alpha: number = 0.25;
+  filter?: WeaviateFilter;
+
+  constructor(fields: WeaviateHybridRetrieverInput) {
+    super(fields);
+    this.vectorStore = fields.vectorStore;
+    this.k = fields.k ?? this.k;
+    this.alpha = fields.alpha ?? this.alpha;
+    this.filter = fields.filter;
+  }
+
+  _getRelevantDocuments(
+    query: string,
+    _runManager?: CallbackManagerForRetrieverRun
+  ): Promise<DocumentInterface[]> {
+    return this.vectorStore.hybridSearch(
+      query,
+      this.k,
+      this.alpha,
+      this.filter
+    );
+  }
+}
+
 /**
  * Class that extends the `VectorStore` base class. It provides methods to
  * interact with a Weaviate index, including adding vectors and documents,
@@ -133,6 +187,26 @@ export class WeaviateStore extends VectorStore {
         ]),
       ];
     }
+  }
+
+  asHybridRetriever(
+    fields?: Partial<WeaviateHybridRetrieverInput>,
+    filter?: WeaviateFilter,
+    callbacks?: Callbacks,
+    tags?: string[],
+    metadata?: Record<string, unknown>,
+    verbose?: boolean
+  ): WeaviateHybridRetriever {
+    return new WeaviateHybridRetriever({
+      vectorStore: this,
+      k: fields?.k,
+      alpha: fields?.alpha,
+      filter,
+      tags: [...(tags ?? []), this._vectorstoreType()],
+      metadata,
+      verbose,
+      callbacks,
+    });
   }
 
   /**
@@ -372,6 +446,64 @@ export class WeaviateStore extends VectorStore {
     return mmrIndexes
       .filter((idx) => idx !== -1)
       .map((idx) => allResults[idx][0]);
+  }
+
+  /**
+   * Method to perform a hybrid search (similarity and text) on the stored entries in the Weaviate index.
+   * It returns the top k best matching documents.
+   * The parameter `alpha` controls the balance between the similarity and text search.
+   *
+   * @see https://weaviate.io/developers/weaviate/search/hybrid
+   *
+   * @param query The query string.
+   * @param k The number of best matching documents to return.
+   * @param alpha A number between 0 and 1 that determines the balance between the similarity and text search. 0 means pure keyword search, 1 means pure similarity search.
+   * @param filter Optional filter to apply to the search.
+   */
+  async hybridSearch(
+    query: string,
+    k: number,
+    alpha: number,
+    filter?: WeaviateFilter
+  ): Promise<Document[]> {
+    try {
+      const queryVector = await this.embeddings.embedQuery(query)
+      let builder = this.client.graphql
+        .get()
+        .withClassName(this.indexName)
+        .withFields(`${this.queryAttrs.join(" ")}`)
+        .withHybrid({
+          query: query,
+          vector: queryVector,
+          alpha: alpha,
+        })
+        .withLimit(k);
+
+      if (this.tenant) {
+        builder = builder.withTenant(this.tenant);
+      }
+
+      if (filter?.where) {
+        builder = builder.withWhere(filter.where);
+      }
+
+      const result = await builder.do();
+
+      const documents: Document[] = [];
+      for (const data of result.data.Get[this.indexName]) {
+        const { [this.textKey]: text, _additional, ...rest }: ResultRow = data;
+
+        documents.push(
+          new Document({
+            pageContent: text,
+            metadata: rest,
+          })
+        );
+      }
+      return documents;
+    } catch (e) {
+      throw Error(`Error in hybridSearch ${e}`);
+    }
   }
 
   /**
