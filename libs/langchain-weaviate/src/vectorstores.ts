@@ -1,10 +1,10 @@
 import * as uuid from "uuid";
 import type {
-  FusionType,
   WeaviateClient,
   WeaviateObject,
   WhereFilter,
 } from "weaviate-ts-client";
+import { FusionType } from "weaviate-ts-client";
 import {
   MaxMarginalRelevanceSearchOptions,
   VectorStore,
@@ -93,13 +93,14 @@ export interface WeaviateFilter {
 
 export type WeaviateHybridRetrieverKwargs = {
   alpha?: number;
-  // TODO: to be elaborated
+  fusionType?: FusionType;
 };
 
 export type WeaviateHybridRetrieverInput = BaseRetrieverInput & {
   vectorStore: WeaviateStore;
   k?: number;
   alpha?: number;
+  fusionType?: FusionType;
   filter?: WeaviateFilter;
   searchKwargs?: WeaviateHybridRetrieverKwargs;
 };
