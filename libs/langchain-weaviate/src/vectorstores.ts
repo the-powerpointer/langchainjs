@@ -210,6 +210,7 @@ export class WeaviateStore extends VectorStore {
       vectorStore: this,
       k: fields?.k,
       alpha: fields?.alpha,
+      fusionType: fields?.fusionType,
       filter,
       tags: [...(tags ?? []), this._vectorstoreType()],
       metadata,
