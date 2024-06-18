@@ -4,14 +4,15 @@ import {
   Part,
   type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
   type FunctionDeclaration as GenerativeAIFunctionDeclaration,
+  POSSIBLE_ROLES,
 } from "@google/generative-ai";
 import {
   AIMessage,
   AIMessageChunk,
   BaseMessage,
   ChatMessage,
-  MessageContent,
   MessageContentComplex,
+  UsageMetadata,
   isBaseMessage,
 } from "@langchain/core/messages";
 import {
@@ -21,12 +22,16 @@ import {
 } from "@langchain/core/outputs";
 import { StructuredToolInterface } from "@langchain/core/tools";
 import { isStructuredTool } from "@langchain/core/utils/function_calling";
+import { ToolCallChunk } from "@langchain/core/messages/tool";
 import { zodToGenerativeAIParameters } from "./zod_to_genai_parameters.js";
 
 export function getMessageAuthor(message: BaseMessage) {
   const type = message._getType();
   if (ChatMessage.isInstance(message)) {
     return message.role;
+  }
+  if (type === "tool") {
+    return type;
   }
   return message.name ?? type;
 }
@@ -37,7 +42,9 @@ export function getMessageAuthor(message: BaseMessage) {
  * @param model The model to use for mapping.
  * @returns The message type mapped to a Google Generative AI chat author.
  */
-export function convertAuthorToRole(author: string) {
+export function convertAuthorToRole(
+  author: string
+): (typeof POSSIBLE_ROLES)[number] {
   switch (author) {
     /**
      *  Note: Gemini currently is not supporting system messages
@@ -49,6 +56,9 @@ export function convertAuthorToRole(author: string) {
     case "system":
     case "human":
       return "user";
+    case "tool":
+    case "function":
+      return "function";
     default:
       throw new Error(`Unknown / unsupported author: ${author}`);
   }
@@ -68,14 +78,42 @@ function messageContentMedia(content: MessageContentComplex): Part {
 }
 
 export function convertMessageContentToParts(
-  content: MessageContent,
-  isMultimodalModel: boolean
+  message: BaseMessage,
+  isMultimodalModel: boolean,
+  role: (typeof POSSIBLE_ROLES)[number]
 ): Part[] {
-  if (typeof content === "string") {
-    return [{ text: content }];
+  if (typeof message.content === "string") {
+    return [{ text: message.content }];
   }
 
-  return content.map((c) => {
+  let functionCallParts: Part[] = [];
+  if (role === "function") {
+    if (message.name && typeof message.content === "string") {
+      functionCallParts.push({
+        functionResponse: {
+          name: message.name,
+          response: message.content,
+        },
+      });
+    } else {
+      throw new Error(
+        "ChatGoogleGenerativeAI requires tool messages to contain the tool name, and a string content."
+      );
+    }
+  }
+  if ("tool_calls" in message) {
+    const castMessage = message as AIMessage;
+    if (castMessage.tool_calls && castMessage.tool_calls.length > 0) {
+      functionCallParts = castMessage.tool_calls.map((tc) => ({
+        functionCall: {
+          name: tc.name,
+          args: tc.args,
+        },
+      }));
+    }
+  }
+
+  const messageContentParts = message.content.map((c) => {
     if (c.type === "text") {
       return {
         text: c.text,
@@ -112,9 +150,17 @@ export function convertMessageContentToParts(
       };
     } else if (c.type === "media") {
       return messageContentMedia(c);
+    } else if (c.type === "tool_use") {
+      return {
+        functionCall: {
+          name: c.name,
+          args: c.input,
+        },
+      };
     }
     throw new Error(`Unknown content type ${(c as { type: string }).type}`);
   });
+  return [...messageContentParts, ...functionCallParts];
 }
 
 export function convertBaseMessagesToContent(
@@ -147,8 +193,9 @@ export function convertBaseMessagesToContent(
       }
 
       const parts = convertMessageContentToParts(
-        message.content,
-        isMultimodalModel
+        message,
+        isMultimodalModel,
+        role
       );
 
       if (acc.mergeWithPreviousContent) {
@@ -165,8 +212,13 @@ export function convertBaseMessagesToContent(
           content: acc.content,
         };
       }
+      let actualRole = role;
+      if (actualRole === "function") {
+        // GenerativeAI API will throw an error if the role is not "user" or "model."
+        actualRole = "user";
+      }
       const content: Content = {
-        role,
+        role: actualRole,
         parts,
       };
       return {
@@ -179,7 +231,10 @@ export function convertBaseMessagesToContent(
 }
 
 export function mapGenerateContentResultToChatResult(
-  response: EnhancedGenerateContentResponse
+  response: EnhancedGenerateContentResponse,
+  extra?: {
+    usageMetadata: UsageMetadata | undefined;
+  }
 ): ChatResult {
   // if rejected or error, return empty generations with reason in filters
   if (
@@ -208,6 +263,7 @@ export function mapGenerateContentResultToChatResult(
       additional_kwargs: {
         ...generationInfo,
       },
+      usage_metadata: extra?.usageMetadata,
     }),
     generationInfo,
   };
@@ -218,23 +274,40 @@ export function mapGenerateContentResultToChatResult(
 }
 
 export function convertResponseContentToChatGenerationChunk(
-  response: EnhancedGenerateContentResponse
+  response: EnhancedGenerateContentResponse,
+  extra: {
+    usageMetadata?: UsageMetadata | undefined;
+    index: number;
+  }
 ): ChatGenerationChunk | null {
   if (!response.candidates || response.candidates.length === 0) {
     return null;
   }
+  const functionCalls = response.functionCalls();
   const [candidate] = response.candidates;
   const { content, ...generationInfo } = candidate;
   const text = content?.parts[0]?.text ?? "";
 
+  const toolCallChunks: ToolCallChunk[] = [];
+  if (functionCalls) {
+    toolCallChunks.push(
+      ...functionCalls.map((fc) => ({
+        ...fc,
+        args: JSON.stringify(fc.args),
+        index: extra.index,
+      }))
+    );
+  }
   return new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
       content: text,
       name: !content ? undefined : content.role,
+      tool_call_chunks: toolCallChunks,
       // Each chunk can have unique "generationInfo", and merging strategy is unclear,
       // so leave blank for now.
       additional_kwargs: {},
+      usage_metadata: extra.usageMetadata,
     }),
     generationInfo,
   });
