@@ -1,5 +1,6 @@
 import * as uuid from "uuid";
 import type {
+  FusionType,
   WeaviateClient,
   WeaviateObject,
   WhereFilter,
@@ -113,8 +114,13 @@ export class WeaviateHybridRetriever extends BaseRetriever {
   }
 
   vectorStore: WeaviateStore;
+
   k: number = 4;
+
   alpha: number = 0.25;
+
+  fusionType: FusionType = FusionType.relativeScoreFusion;
+
   filter?: WeaviateFilter;
 
   constructor(fields: WeaviateHybridRetrieverInput) {
@@ -122,6 +128,7 @@ export class WeaviateHybridRetriever extends BaseRetriever {
     this.vectorStore = fields.vectorStore;
     this.k = fields.k ?? this.k;
     this.alpha = fields.alpha ?? this.alpha;
+    this.fusionType = fields.fusionType ?? this.fusionType;
     this.filter = fields.filter;
   }
 
@@ -133,6 +140,7 @@ export class WeaviateHybridRetriever extends BaseRetriever {
       query,
       this.k,
       this.alpha,
+      this.fusionType,
       this.filter
     );
   }
@@ -458,24 +466,27 @@ export class WeaviateStore extends VectorStore {
    * @param query The query string.
    * @param k The number of best matching documents to return.
    * @param alpha A number between 0 and 1 that determines the balance between the similarity and text search. 0 means pure keyword search, 1 means pure similarity search.
+   * @param fusionType The fusion method to be used for combining the similarity and text search results.
    * @param filter Optional filter to apply to the search.
    */
   async hybridSearch(
     query: string,
     k: number,
     alpha: number,
+    fusionType: FusionType,
     filter?: WeaviateFilter
   ): Promise<Document[]> {
     try {
-      const queryVector = await this.embeddings.embedQuery(query)
+      const queryVector = await this.embeddings.embedQuery(query);
       let builder = this.client.graphql
         .get()
         .withClassName(this.indexName)
         .withFields(`${this.queryAttrs.join(" ")}`)
         .withHybrid({
-          query: query,
+          query,
           vector: queryVector,
-          alpha: alpha,
+          alpha,
+          fusionType,
         })
         .withLimit(k);
 
